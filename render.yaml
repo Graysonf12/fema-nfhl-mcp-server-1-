@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: fema-nfhl-mcp-server
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: MCP_API_TOKEN
+        generateValue: true
