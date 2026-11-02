@@ -39,40 +39,76 @@ export async function identifyAtPoint(
     spatialReference: { wkid: 4326 }
   });
 
-  try {
-    const response = await axios.get<ArcGisIdentifyResponse>(
-      `${NFHL_BASE_URL}/identify`,
-      {
-        timeout: REQUEST_TIMEOUT_MS,
-        params: {
-          geometry,
-          geometryType: "esriGeometryPoint",
-          sr: 4326,
-          layers: `all:${layerIds.join(",")}`,
-          tolerance: 3,
-          mapExtent,
-          imageDisplay: "600,550,96",
-          returnGeometry: false,
-          f: "json"
-        }
+  const request = () =>
+    axios.get<ArcGisIdentifyResponse>(`${NFHL_BASE_URL}/identify`, {
+      timeout: REQUEST_TIMEOUT_MS,
+      params: {
+        geometry,
+        geometryType: "esriGeometryPoint",
+        sr: 4326,
+        layers: `all:${layerIds.join(",")}`,
+        tolerance: 3,
+        mapExtent,
+        imageDisplay: "600,550,96",
+        returnGeometry: false,
+        f: "json"
       }
-    );
+    });
+
+  // FEMA's public service drops connections now and then (ECONNRESET, timeouts,
+  // 5xx) and usually answers again within seconds to minutes (seen live
+  // 2026-11-02: down ~10 min, then fine). Retry once after a short pause before
+  // giving up, so a brief blip doesn't fail the whole lookup.
+  try {
+    const response = await request();
     return response.data.results ?? [];
-  } catch (error) {
-    throw new Error(formatNfhlError(error, point));
+  } catch (firstError) {
+    if (!isTransient(firstError)) {
+      throw new Error(formatNfhlError(firstError, point));
+    }
+    await sleep(RETRY_DELAY_MS);
+    try {
+      const response = await request();
+      return response.data.results ?? [];
+    } catch (secondError) {
+      throw new Error(formatNfhlError(secondError, point, true));
+    }
   }
 }
 
-export function formatNfhlError(error: unknown, point?: QueriedPoint): string {
+const RETRY_DELAY_MS = 1500;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Network drops, timeouts, rate limits and server-side errors are worth one
+// retry. A 4xx other than 429 means the request itself is wrong — don't retry.
+function isTransient(error: unknown): boolean {
+  if (!(error instanceof AxiosError)) return false;
+  if (!error.response) return true;
+  const status = error.response.status;
+  return status === 429 || status >= 500;
+}
+
+export function formatNfhlError(error: unknown, point?: QueriedPoint, retried = false): string {
   const where = point ? ` for point (${point.latitude}, ${point.longitude})` : "";
+  const after = retried ? " (after one automatic retry)" : "";
+  const outage =
+    " FEMA's public NFHL service has short outages that usually clear within minutes — try again shortly; if it is still down, fall back to the manual msc.fema.gov coordinate route.";
   if (error instanceof AxiosError) {
     if (error.response) {
-      return `FEMA NFHL request failed${where} with HTTP ${error.response.status}. The public NFHL ArcGIS service is occasionally rate-limited or briefly unavailable — retry once before treating this as a hard block.`;
+      return `FEMA NFHL request failed${where} with HTTP ${error.response.status}${after}.${outage}`;
     }
     if (error.code === "ECONNABORTED") {
-      return `FEMA NFHL request timed out${where} after ${REQUEST_TIMEOUT_MS}ms. Retry; if it persists across multiple points, the service may be down — fall back to the manual msc.fema.gov coordinate route.`;
+      return `FEMA NFHL request timed out${where} after ${REQUEST_TIMEOUT_MS}ms${after}.${outage}`;
     }
-    return `FEMA NFHL network error${where}: ${error.message}.`;
+    return `FEMA NFHL could not be reached${where}${after}: ${error.message}.${outage}`;
+  }
+  // identifyAtPoint already throws a formatted message — pass it through
+  // instead of wrapping it a second time.
+  if (error instanceof Error && error.message.startsWith("FEMA NFHL")) {
+    return error.message;
   }
   return `Unexpected error querying FEMA NFHL${where}: ${
     error instanceof Error ? error.message : String(error)
@@ -98,7 +134,7 @@ export function extractFloodZones(results: ArcGisIdentifyResult[]): FloodZoneFin
       fldZone: asString(r.attributes.FLD_ZONE),
       zoneSubtype: asString(r.attributes.ZONE_SUBTY),
       sfhaFlag: asString(r.attributes.SFHA_TF),
-      staticBfeFeet: asNumber(r.attributes.STATIC_BFE),
+      staticBfeFeet: asBfe(r.attributes.STATIC_BFE),
       vDatum: asString(r.attributes.V_DATUM),
       dfirmId: asString(r.attributes.DFIRM_ID),
       floodAreaId: asString(r.attributes.FLD_AR_ID),
@@ -130,10 +166,14 @@ function asString(value: string | number | null | undefined): string | null {
   return s.length ? s : null;
 }
 
-function asNumber(value: string | number | null | undefined): number | null {
+// FEMA stores "no BFE established" as -9999 (seen live 2026-11-02 on a Zone X
+// polygon). Treat that sentinel — and any similar large negative — as "no BFE",
+// never as an elevation.
+function asBfe(value: string | number | null | undefined): number | null {
   if (value === null || value === undefined) return null;
   const n = Number(value);
-  return Number.isFinite(n) ? n : null;
+  if (!Number.isFinite(n) || n <= -9000) return null;
+  return n;
 }
 
 // ArcGIS date fields commonly arrive as epoch milliseconds (number) or as
