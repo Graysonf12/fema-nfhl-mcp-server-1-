@@ -36,7 +36,7 @@ export async function runFloodZoneLookup(params: FloodZoneLookupInput) {
       content: [
         {
           type: "text" as const,
-          text: `Error: could not resolve any of the ${params.points.length} point(s) against the FEMA NFHL service. ${detail} Fall back to the manual msc.fema.gov coordinate route per standing SIR doctrine — do not leave the field silently unrouted.`
+          text: `Error: could not resolve any of the ${params.points.length} point(s) against the FEMA NFHL service. ${detail} Per standing SIR doctrine, do not leave the field silently unrouted.`
         }
       ]
     };
@@ -79,7 +79,20 @@ export async function runFloodZoneLookup(params: FloodZoneLookupInput) {
   };
 }
 
+// A point near a county or community line can return FIRM panels from more
+// than one study (seen live 2026-11-02: a Marion County panel, 47115C, came back
+// beside the Hamilton County panel, 47065C, that actually maps the point). The
+// panel whose DFIRM study matches the flood-zone polygon's study is the one
+// that governs here; any other panel is flagged rather than silently listed.
+function panelGoverns(panelDfirm: string | null, zoneDfirms: Set<string>): boolean | null {
+  if (!zoneDfirms.size || !panelDfirm) return null;
+  return zoneDfirms.has(panelDfirm);
+}
+
 function formatPointForOutput(r: PointFloodResult) {
+  const zoneDfirms = new Set(
+    r.floodZones.map((z) => z.dfirmId).filter((d): d is string => Boolean(d))
+  );
   return {
     label: r.point.label,
     latitude: r.point.latitude,
@@ -99,7 +112,8 @@ function formatPointForOutput(r: PointFloodResult) {
       panel_number: p.firmPanelNumber,
       effective_date: p.effectiveDate,
       status: p.status,
-      dfirm_id: p.dfirmId
+      dfirm_id: p.dfirmId,
+      governs_this_point: panelGoverns(p.dfirmId, zoneDfirms)
     })),
     note:
       r.floodZones.length === 0
@@ -168,8 +182,14 @@ function renderMarkdown(
       if (z.dfirm_id) lines.push(`  - DFIRM ID: ${z.dfirm_id}`);
     }
     for (const panel of p.firm_panels) {
+      const governs =
+        panel.governs_this_point === true
+          ? " · ✅ governs this point (same study as the flood zone)"
+          : panel.governs_this_point === false
+            ? ` · ⚠ different study (${panel.dfirm_id}) from the flood zone mapped here — not the governing panel; confirm which county/community study applies before citing it`
+            : "";
       lines.push(
-        `  - FIRM Panel: ${panel.panel_number ?? "(not returned)"} · Effective: ${panel.effective_date ?? "(not returned)"} · Status: ${panel.status ?? "n/a"}`
+        `  - FIRM Panel: ${panel.panel_number ?? "(not returned)"} · Effective: ${panel.effective_date ?? "(not returned)"} · Status: ${panel.status ?? "n/a"}${governs}`
       );
     }
     lines.push("");
